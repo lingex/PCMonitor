@@ -1,0 +1,1 @@
+pyinstaller --onefile --noconsole --icon="icon.ico" --add-data="icon.ico;."  --hidden-import="uvicorn.loops.auto"  --hidden-import="uvicorn.lifespan.auto"  --hidden-import="uvicorn.protocols.http.auto"  --hidden-import="uvicorn.protocols.websockets.auto"  sysmonitor.py

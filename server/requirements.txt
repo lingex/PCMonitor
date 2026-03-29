@@ -1,0 +1,6 @@
+# requirements.txt
+fastapi
+uvicorn[standard]
+psutil
+pystray
+pillow

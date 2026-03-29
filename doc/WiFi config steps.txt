@@ -1,0 +1,43 @@
+# WiFi Config Steps
+
+## Connect the device to a computer
+
+## Open this website with Chrome
+https://thelastoutpostworkshop.github.io/ESPConnect/
+
+## Click on the CONNECT button
+
+## Choose the device in the dialog and click connect
+
+## Click the LittleFS Tools
+There should be a file name 'config.json' in it
+
+## Click the BACKUP to backup the hole fash partition
+
+## Click the download button to download the config.json
+
+## Edit the config.json, set your ssid and password
+
+## UPLOAD the config.json
+
+## Click SAVE TO FLASH
+
+## Review the config.json
+
+## Click DISCONNECT or switch to Serial Monitor and click Start to check the log
+
+
+
+# WiFi 配置步骤
+
+## 设备连接到 PC USB, 打开设备管理器确认“端口(COM和LPT)”下多出一个 USB串行设备(COMx) 的设备
+
+## Chrome打开这个网页(网友开发的ESP系列芯片管理工具)
+https://thelastoutpostworkshop.github.io/ESPConnect/
+
+## 网页上点击 CONNECT 按钮，会弹出选择确认窗口，选择正确设备点击连接，能正常加载信息再进行下一步
+
+## 切换到LiteFS Tools页签，按图示步骤操作
+config wifi info using espconnect.png
+
+## 点击 DISCONNECT 设备重启进入工作模式，也可以切换到 Serial Monitor 点击 Start 也可以进入工作模式并查看串口输出 log
