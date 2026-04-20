@@ -44,10 +44,10 @@ size_t currentServerIndex = 0;
 uint32_t pendingRestartAtMs = 0;
 
 String hw_ver = "1.2";
-String sw_ver = "1.3";
+String sw_ver = "1.4";
 
 const string ntpServerName = "ntp6.aliyun.com";
-const int timeZone = 8;
+int timeZoneHours = 8;
 unsigned int localPort = 8000;
 
 constexpr bool kWifiDisablePowerSave = true;
@@ -100,6 +100,10 @@ const char *WiFiBandPreferenceKey(WiFiBandPreference pref);
 const char *WiFiBandPreferenceLabel(WiFiBandPreference pref);
 WiFiBandPreference WiFiBandPreferenceFromString(const String &value);
 String BuildWiFiBandPreferenceHtml(const char *fieldName);
+String DayOrdinalSuffix(int dayOfMonth);
+String BuildDateLabel();
+bool TryParseTimezoneHours(const String &value, int &parsedHours);
+void ApplyTimeZoneHours(int newTimeZoneHours);
 String HtmlEscape(const String &value);
 void ApplyBacklightState(bool turnOn);
 bool ShouldBacklightBeOnAt(uint16_t currentMins);
@@ -233,6 +237,61 @@ String HtmlEscape(const String &value)
 		}
 	}
 	return out;
+}
+
+String DayOrdinalSuffix(int dayOfMonth)
+{
+	if (dayOfMonth >= 11 && dayOfMonth <= 13)
+		return "th";
+
+	switch (dayOfMonth % 10)
+	{
+	case 1:
+		return "st";
+	case 2:
+		return "nd";
+	case 3:
+		return "rd";
+	default:
+		return "th";
+	}
+}
+
+String BuildDateLabel()
+{
+	return String(monthShortStr(month())) + "," + String(day()) + DayOrdinalSuffix(day());
+}
+
+bool TryParseTimezoneHours(const String &value, int &parsedHours)
+{
+	String trimmed = value;
+	trimmed.trim();
+	if (trimmed.isEmpty())
+		return false;
+
+	char *endPtr = nullptr;
+	long candidate = strtol(trimmed.c_str(), &endPtr, 10);
+	if (endPtr == trimmed.c_str() || *endPtr != '\0')
+		return false;
+	if (candidate < -12 || candidate > 14)
+		return false;
+
+	parsedHours = (int)candidate;
+	return true;
+}
+
+void ApplyTimeZoneHours(int newTimeZoneHours)
+{
+	if (newTimeZoneHours == timeZoneHours)
+		return;
+
+	int oldTimeZoneHours = timeZoneHours;
+	timeZoneHours = newTimeZoneHours;
+
+	if (timeStatus() == timeSet)
+	{
+		setTime(now() + ((long)(timeZoneHours - oldTimeZoneHours) * SECS_PER_HOUR));
+	}
 }
 
 void ApplyBacklightState(bool turnOn)
@@ -415,6 +474,7 @@ void saveConfig()
 	doc["autoBacklight"] = autoBacklightEnabled;
 	doc["onTime"] = minutesToTimeString(backlightOnTime);
 	doc["offTime"] = minutesToTimeString(backlightOffTime);
+	doc["timeZone"] = timeZoneHours;
 	JsonArray arr = doc.createNestedArray("servers");
 	for (auto &s : serverList)
 		arr.add(s);
@@ -502,6 +562,12 @@ void loadConfig()
 		String offTimeStr = doc["offTime"].as<String>();
 		backlightOffTime = timeStringToMinutes(offTimeStr);
 	}
+	if (doc.containsKey("timeZone"))
+	{
+		int loadedTimeZoneHours = doc["timeZone"].as<int>();
+		if (loadedTimeZoneHours >= -12 && loadedTimeZoneHours <= 14)
+			timeZoneHours = loadedTimeZoneHours;
+	}
 
 	serverList.clear();
 	if (doc.containsKey("servers") && doc["servers"].is<JsonArray>())
@@ -531,6 +597,8 @@ void loadConfig()
 	Serial.println(backlightPwm);
 	Serial.print("Rotation:");
 	Serial.println(lcdRotation);
+	Serial.print("Time zone:");
+	Serial.println(timeZoneHours);
 	Serial.print("Servers:");
 	for (auto &s : serverList)
 	{
@@ -1144,7 +1212,11 @@ void DisplayStatus()
 	// HOSTNAME
 	u8g2.setFont(u8g2_font_siji_t_6x10);
 	u8g2.drawStr(0, 63, String(String("Host:") + host_name).c_str());
-	u8g2.drawStr(87, 63, String(String(monthShortStr(month())) + String(",") + String(day() + String("th"))).c_str());
+	String dateLabel = BuildDateLabel();
+	int16_t dateX = 128 - u8g2.getStrWidth(dateLabel.c_str());
+	if (dateX < 0)
+		dateX = 0;
+	u8g2.drawStr(dateX, 63, dateLabel.c_str());
 
 	String idxStr = String("[") + String(currentServerIndex + 1) + String("/") + String(serverList.size()) + String("]");
 	u8g2.drawStr(54, 8, idxStr.c_str());
@@ -1313,7 +1385,7 @@ time_t GetNtpTime()
 			secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
 			secsSince1900 |= (unsigned long)packetBuffer[43];
 			// Serial.println(secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR);
-			return secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR;
+			return secsSince1900 - 2208988800UL + timeZoneHours * SECS_PER_HOUR;
 		}
 	}
 	Serial.println("No NTP Response :-(");
@@ -1611,10 +1683,17 @@ void HandleConfigModern()
 		bool restartRequired = false;
 		int web_lcdbl = server.hasArg("web_bl") ? server.arg("web_bl").toInt() : backlightPwm;
 		int web_setro = server.hasArg("web_set_rotation") ? server.arg("web_set_rotation").toInt() : lcdRotation;
+		int newTimeZoneHours = timeZoneHours;
 		String web_ws_list = server.arg("web_ws_list");
 		WiFiBandPreference newBandPreference = server.hasArg("web_wifi_band") ? WiFiBandPreferenceFromString(server.arg("web_wifi_band")) : wifiBandPreference;
 		String newSsid = server.hasArg("web_ssid") ? server.arg("web_ssid") : String(wificonf.stassid);
 		String newPassword = server.hasArg("web_psw") ? server.arg("web_psw") : String(wificonf.stapsw);
+		if (server.hasArg("web_timezone"))
+		{
+			int parsedTimeZoneHours = timeZoneHours;
+			if (TryParseTimezoneHours(server.arg("web_timezone"), parsedTimeZoneHours))
+				newTimeZoneHours = parsedTimeZoneHours;
+		}
 
 		newSsid.trim();
 		if (newSsid.length() >= (int)sizeof(wificonf.stassid))
@@ -1651,6 +1730,11 @@ void HandleConfigModern()
 		{
 			wifiBandPreference = newBandPreference;
 			restartRequired = true;
+		}
+
+		if (newTimeZoneHours != timeZoneHours)
+		{
+			ApplyTimeZoneHours(newTimeZoneHours);
 		}
 
 		if (web_ws_list.length() > 0)
@@ -1719,6 +1803,7 @@ void HandleConfigModern()
 	String activeServer = (!serverList.empty() && currentServerIndex < serverList.size()) ? HtmlEscape(serverList[currentServerIndex]) : String("-");
 	String connectionState = WiFi.isConnected() ? String("Online") : String("Offline");
 	String bandPref = String(WiFiBandPreferenceKey(wifiBandPreference));
+	String timeZoneLabel = String(timeZoneHours);
 
 	String serversText;
 	for (size_t i = 0; i < serverList.size(); i++)
@@ -1877,6 +1962,10 @@ textarea{min-height:164px;resize:vertical}
 	content += "><span>Enable automatic schedule</span></label>";
 	content += "<div class='inline'><div class='field'><label for='on_time'>On Time</label><input id='on_time' type='text' name='on_time' value='" + String(onTimeStr) + "' placeholder='07:00' pattern='\\d{2}:\\d{2}'></div>";
 	content += "<div class='field'><label for='off_time'>Off Time</label><input id='off_time' type='text' name='off_time' value='" + String(offTimeStr) + "' placeholder='22:00' pattern='\\d{2}:\\d{2}'></div></div></section>";
+
+	content += "<section class='card'><h2>Time</h2><p>Set the local timezone used for NTP-synchronized clock display.</p>";
+	content += "<div class='field'><label for='web_timezone'>UTC Offset</label><input id='web_timezone' type='number' name='web_timezone' min='-12' max='14' step='1' value='" + timeZoneLabel + "'></div>";
+	content += "<div class='hint'>Default is UTC+8. Changes apply immediately and are saved to flash.</div></section>";
 
 	content += "<section class='card'><h2>Servers</h2><p>One WebSocket endpoint per line. The first line is treated as the default server.</p>";
 	content += "<div class='field'><label for='web_ws_list'>Server List</label><textarea id='web_ws_list' name='web_ws_list'>" + serversText + "</textarea></div></section>";
