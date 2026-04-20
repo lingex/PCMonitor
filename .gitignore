@@ -1,2 +1,5 @@
 .pio
 .vscode
+*.exe
+*.obj
+*.o
