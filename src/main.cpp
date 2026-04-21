@@ -56,6 +56,10 @@ constexpr bool kWifiForceHt20 = true;
 constexpr wifi_power_t kWifiTxPower = WIFI_POWER_20dBm;
 constexpr uint32_t kWifiConnectTimeoutMs = 20000;
 constexpr uint32_t kBootWifiInfoDisplayMs = 2000;
+constexpr uint8_t kHeaderWeekdayX = 86;
+constexpr uint8_t kHeaderWifiIconX = 103;
+constexpr uint8_t kHeaderServerIconX = 118;
+constexpr uint8_t kHeaderStatusBaselineY = 8;
 
 enum class WiFiBandPreference : uint8_t
 {
@@ -89,6 +93,8 @@ void SetLcdRotation(int val);
 void DisplayStatus();
 void DisplayOTAStatus();
 void DisplayBootWifiInfo();
+uint32_t GetWiFiStatusGlyph();
+void DrawServerStatusIcon(uint8_t x, uint8_t baselineY, bool connected);
 time_t GetNtpTime();
 void SendNTPpacket(IPAddress &address);
 void DateTime();
@@ -1444,40 +1450,56 @@ void DateTime()
 	sprintf(buf, "%02d:%02d:%02d", hour(), minute(), second());
 	u8g2.drawStr(0, 8, buf);
 
-	u8g2.drawStr(96, 8, String(dayShortStr(weekday())).c_str());
+	u8g2.drawStr(kHeaderWeekdayX, kHeaderStatusBaselineY, String(dayShortStr(weekday())).c_str());
+	u8g2.drawGlyph(kHeaderWifiIconX, kHeaderStatusBaselineY, GetWiFiStatusGlyph());
+	DrawServerStatusIcon(kHeaderServerIconX, kHeaderStatusBaselineY, WiFi.isConnected() && webSocket.isConnected());
 
-	if (WiFi.isConnected() && webSocket.isConnected())
+	if (WiFi.isConnected())
 	{
-		// Select wifi glyph based on RSSI strength
 		int32_t rssi = WiFi.RSSI(); // dBm (negative values)
-		// map RSSI to three levels: strong, medium, weak
-		uint32_t wifiGlyph = 0x0e218; // default weak
-		if (rssi > -60)
-		{
-			wifiGlyph = 0x0e21a; // strong
-		}
-		else if (rssi > -75)
-		{
-			wifiGlyph = 0x0e219; // medium
-		}
-		else
-		{
-			wifiGlyph = 0x0e218; // weak
-		}
-		u8g2.drawGlyph(116, 8, wifiGlyph); // wifi signal icon
 		Serial.printf("Wifi ssid: ");
 		Serial.printf(wificonf.stassid);
 		Serial.printf(", rssi: ");
 		Serial.println(rssi);
 	}
-	else
-	{
-		u8g2.drawGlyph(116, 8, 0x0e217); // disconnected icon
-	}
 
 	u8g2.drawHLine(0, 9, 128); // draw a line
 
 	// u8g2.sendBuffer();
+}
+
+uint32_t GetWiFiStatusGlyph()
+{
+	if (!WiFi.isConnected())
+		return 0x0e217; // disconnected
+
+	int32_t rssi = WiFi.RSSI();
+	if (rssi > -60)
+		return 0x0e21a; // strong
+	if (rssi > -75)
+		return 0x0e219; // medium
+	return 0x0e218;	 // weak
+}
+
+void DrawServerStatusIcon(uint8_t x, uint8_t baselineY, bool connected)
+{
+	uint8_t top = baselineY >= 7 ? (baselineY - 7) : 0;
+
+	u8g2.drawFrame(x, top + 1, 7, 6);
+	u8g2.drawPixel(x + 1, top + 3);
+	u8g2.drawPixel(x + 1, top + 5);
+	u8g2.drawHLine(x + 2, top + 3, 3);
+	u8g2.drawHLine(x + 2, top + 5, 3);
+
+	if (connected)
+	{
+		u8g2.drawDisc(x + 6, top + 1, 1, U8G2_DRAW_ALL);
+	}
+	else
+	{
+		u8g2.drawLine(x + 5, top, x + 7, top + 2);
+		u8g2.drawLine(x + 5, top + 2, x + 7, top);
+	}
 }
 
 void DisplayOTAStatus()
