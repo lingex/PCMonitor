@@ -1485,20 +1485,14 @@ void DrawServerStatusIcon(uint8_t x, uint8_t baselineY, bool connected)
 {
 	uint8_t top = baselineY >= 7 ? (baselineY - 7) : 0;
 
-	u8g2.drawFrame(x, top + 1, 7, 6);
-	u8g2.drawPixel(x + 1, top + 3);
-	u8g2.drawPixel(x + 1, top + 5);
-	u8g2.drawHLine(x + 2, top + 3, 3);
-	u8g2.drawHLine(x + 2, top + 5, 3);
-
 	if (connected)
 	{
-		u8g2.drawDisc(x + 6, top + 1, 1, U8G2_DRAW_ALL);
+		u8g2.drawCircle(x + 3, top + 4, 3, U8G2_DRAW_ALL);
 	}
 	else
 	{
-		u8g2.drawLine(x + 5, top, x + 7, top + 2);
-		u8g2.drawLine(x + 5, top + 2, x + 7, top);
+		u8g2.drawLine(x, top + 1, x + 6, top + 7);
+		u8g2.drawLine(x, top + 7, x + 6, top + 1);
 	}
 }
 
