@@ -37,6 +37,7 @@ bool otaUpdating = false;
 // OTA progress tracking for LCD display
 uint8_t otaProgress = 0;
 String otaStatusMsg = "";
+bool forceStatusRefresh = false;
 
 // Support multiple websocket server configurations
 std::vector<String> serverList = { serverUrl };
@@ -54,6 +55,7 @@ constexpr bool kWifiDisablePowerSave = true;
 constexpr bool kWifiForceHt20 = true;
 constexpr wifi_power_t kWifiTxPower = WIFI_POWER_20dBm;
 constexpr uint32_t kWifiConnectTimeoutMs = 20000;
+constexpr uint32_t kBootWifiInfoDisplayMs = 2000;
 
 enum class WiFiBandPreference : uint8_t
 {
@@ -86,6 +88,7 @@ void Webconfig();
 void SetLcdRotation(int val);
 void DisplayStatus();
 void DisplayOTAStatus();
+void DisplayBootWifiInfo();
 time_t GetNtpTime();
 void SendNTPpacket(IPAddress &address);
 void DateTime();
@@ -743,6 +746,9 @@ void setup()
 
 	if (WiFi.status() == WL_CONNECTED)
 	{
+		uint32_t bootWifiInfoStartMs = millis();
+		DisplayBootWifiInfo();
+
 		Serial.println("UDP Starting...");
 		Udp.begin(localPort);
 		setSyncProvider(GetNtpTime);
@@ -986,6 +992,14 @@ bindUploader('filesystemBtn','filesystemFile','filesystem','filesystemBar','file
 			server.send(200, "text/html", page); });
 
 		digitalWrite(LED, LOW); // LED OFF
+
+		uint32_t bootWifiInfoElapsedMs = millis() - bootWifiInfoStartMs;
+		if (bootWifiInfoElapsedMs < kBootWifiInfoDisplayMs)
+		{
+			delay(kBootWifiInfoDisplayMs - bootWifiInfoElapsedMs);
+		}
+
+		forceStatusRefresh = true;
 	}
 
 	if (WiFi.isConnected() && !serverList.empty())
@@ -1029,6 +1043,12 @@ void loop()
 	static int64_t btnChkMs;
 	static int64_t count;
 	static bool led;
+
+	if (forceStatusRefresh)
+	{
+		forceStatusRefresh = false;
+		DisplayStatus();
+	}
 
 	if (curMs - btnChkMs > 10)
 	{
@@ -1483,6 +1503,36 @@ void DisplayOTAStatus()
 		int filledWidth = (otaProgress * barWidth) / 100;
 		u8g2.drawBox(barX, barY, filledWidth, barHeight);
 	}
+
+	u8g2.sendBuffer();
+}
+
+void DisplayBootWifiInfo()
+{
+	String ipAddress = WiFi.localIP().toString();
+	const char *title = "WiFi Connected";
+	const char *label = "IP Address";
+
+	u8g2.clearBuffer();
+
+	u8g2.setFont(u8g2_font_ncenB08_tf);
+	int16_t titleX = (128 - u8g2.getStrWidth(title)) / 2;
+	if (titleX < 0)
+		titleX = 0;
+	u8g2.drawStr(titleX, 18, title);
+
+	u8g2.drawHLine(12, 24, 104);
+
+	u8g2.setFont(u8g2_font_6x12_tr);
+	int16_t labelX = (128 - u8g2.getStrWidth(label)) / 2;
+	if (labelX < 0)
+		labelX = 0;
+	u8g2.drawStr(labelX, 40, label);
+
+	int16_t ipX = (128 - u8g2.getStrWidth(ipAddress.c_str())) / 2;
+	if (ipX < 0)
+		ipX = 0;
+	u8g2.drawStr(ipX, 56, ipAddress.c_str());
 
 	u8g2.sendBuffer();
 }
