@@ -27,9 +27,9 @@ using namespace std;
 String serverUrl = "";
 WebSocketsClient webSocket;
 String statusStr;
-int64_t lostConnectMs = 0;
 // Track when we started attempting to (re)connect to the current server
 int64_t connectAttemptStartMs = 0;
+uint32_t webSocketReconnectPausedUntilMs = 0;
 
 HTTPUpdateServer updateServer;
 bool otaUpdating = false;
@@ -45,7 +45,7 @@ size_t currentServerIndex = 0;
 uint32_t pendingRestartAtMs = 0;
 
 String hw_ver = "1.2";
-String sw_ver = "1.4";
+String sw_ver = "1.5";
 
 const string ntpServerName = "ntp6.aliyun.com";
 int timeZoneHours = 8;
@@ -56,6 +56,12 @@ constexpr bool kWifiForceHt20 = true;
 constexpr wifi_power_t kWifiTxPower = WIFI_POWER_20dBm;
 constexpr uint32_t kWifiConnectTimeoutMs = 20000;
 constexpr uint32_t kBootWifiInfoDisplayMs = 2000;
+constexpr uint32_t kWebSocketReconnectIntervalMs = 2500;
+constexpr uint32_t kWebSocketReconnectPauseMs = 1500;
+constexpr uint32_t kWebSocketSwitchServerTimeoutMs = 60000;
+constexpr uint32_t kWebSocketHeartbeatIntervalMs = 3000;
+constexpr uint32_t kWebSocketHeartbeatTimeoutMs = 1000;
+constexpr uint8_t kWebSocketHeartbeatDisconnectCount = 2;
 constexpr uint8_t kHeaderWeekdayX = 86;
 constexpr uint8_t kHeaderWifiIconX = 103;
 constexpr uint8_t kHeaderServerIconX = 118;
@@ -93,6 +99,9 @@ void SetLcdRotation(int val);
 void DisplayStatus();
 void DisplayOTAStatus();
 void DisplayBootWifiInfo();
+bool BeginManagedWebSocket(const String &url);
+void PauseWebSocketReconnect(uint32_t durationMs = kWebSocketReconnectPauseMs);
+bool IsWebSocketReconnectPaused(uint32_t nowMs);
 uint32_t GetWiFiStatusGlyph();
 void DrawServerStatusIcon(uint8_t x, uint8_t baselineY, bool connected);
 time_t GetNtpTime();
@@ -102,6 +111,7 @@ void DateTime();
 void saveParamCallback();
 void WebSeverInit();
 String GetESPMACAddress();
+void webSocketEvent(WStype_t type, uint8_t *payload, size_t length);
 void ConfigureWiFiRadio();
 void LogWiFiLinkState(const char *stage);
 void WiFiEventHandler(arduino_event_id_t event, arduino_event_info_t info);
@@ -649,15 +659,43 @@ bool WebsocketBegin(String url)
 	return false;
 }
 
+bool BeginManagedWebSocket(const String &url)
+{
+	if (!WebsocketBegin(url))
+		return false;
+
+	webSocket.onEvent(webSocketEvent);
+	webSocket.setReconnectInterval(kWebSocketReconnectIntervalMs);
+	webSocket.enableHeartbeat(
+		kWebSocketHeartbeatIntervalMs,
+		kWebSocketHeartbeatTimeoutMs,
+		kWebSocketHeartbeatDisconnectCount);
+	forceStatusRefresh = true;
+	return true;
+}
+
+void PauseWebSocketReconnect(uint32_t durationMs)
+{
+	webSocketReconnectPausedUntilMs = millis() + durationMs;
+}
+
+bool IsWebSocketReconnectPaused(uint32_t nowMs)
+{
+	return webSocketReconnectPausedUntilMs != 0 && (int32_t)(nowMs - webSocketReconnectPausedUntilMs) < 0;
+}
+
 void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 {
 	switch (type)
 	{
 	case WStype_DISCONNECTED:
 		Serial.println("WebSocket Disconnected");
+		forceStatusRefresh = true;
 		break;
 	case WStype_CONNECTED:
 		Serial.println("WebSocket Connected");
+		connectAttemptStartMs = 0;
+		forceStatusRefresh = true;
 		break;
 	case WStype_TEXT:
 		Serial.printf("WebSocket Message: %s\n", payload);
@@ -1011,10 +1049,9 @@ bindUploader('filesystemBtn','filesystemFile','filesystem','filesystemBar','file
 	if (WiFi.isConnected() && !serverList.empty())
 	{
 		serverUrl = serverList[currentServerIndex];
-		if (!serverUrl.isEmpty() && WebsocketBegin(serverUrl))
+		if (!serverUrl.isEmpty())
 		{
-			webSocket.onEvent(webSocketEvent);
-			webSocket.setReconnectInterval(5000);
+			BeginManagedWebSocket(serverUrl);
 		}
 	}
 	ButtonEventsAttach();
@@ -1076,23 +1113,13 @@ void loop()
 
 	if (WiFi.isConnected() && !serverUrl.isEmpty() && !webSocket.isConnected())
 	{
-		// mark the beginning of this connect attempt period
-		if (lostConnectMs == 0)
+		if (connectAttemptStartMs == 0)
 		{
 			digitalWrite(LED, HIGH);
-			lostConnectMs = curMs;
 			connectAttemptStartMs = curMs; // start counting total timeout window
+			forceStatusRefresh = true;
 		}
-		else if (curMs - lostConnectMs > 10000)
-		{
-			// periodic quick retry (every 10s)
-			lostConnectMs = curMs;
-			webSocket.disconnect();
-			WebsocketBegin(serverUrl);
-		}
-		// if we've been unable to establish a connection for over 1 minute,
-		// switch to the next configured server
-		if (connectAttemptStartMs != 0 && (curMs - connectAttemptStartMs) > 60000)
+		if (connectAttemptStartMs != 0 && (curMs - connectAttemptStartMs) > kWebSocketSwitchServerTimeoutMs)
 		{
 			// advance to next server
 			if (serverList.size() > 1)
@@ -1102,11 +1129,7 @@ void loop()
 				Serial.print("Connection timeout. Switching WebSocket to: ");
 				Serial.println(serverUrl);
 				webSocket.disconnect();
-				if (WebsocketBegin(serverUrl))
-				{
-					webSocket.onEvent(webSocketEvent);
-					webSocket.setReconnectInterval(5000);
-				}
+				BeginManagedWebSocket(serverUrl);
 			}
 			// reset attempt timer to begin measuring again for the new server
 			connectAttemptStartMs = curMs;
@@ -1114,7 +1137,6 @@ void loop()
 	}
 	else
 	{
-		lostConnectMs = 0;
 		connectAttemptStartMs = 0;
 		digitalWrite(LED, LOW);
 	}
@@ -1124,7 +1146,11 @@ void loop()
 		// If OTA is running, avoid starting new websocket activity that might interfere
 		if (!otaUpdating)
 		{
-			webSocket.loop();
+			bool allowWebSocketLoop = webSocket.isConnected() || !IsWebSocketReconnectPaused(curMs);
+			if (allowWebSocketLoop)
+			{
+				webSocket.loop();
+			}
 		}
 		server.handleClient();
 	}
@@ -1142,6 +1168,7 @@ void ButtonEventsAttach()
 	}
 	// B1
 	buttons[0].attachClick([]{
+		PauseWebSocketReconnect();
 		bl_switch = !bl_switch;
 		if (bl_switch)
 		{
@@ -1160,14 +1187,12 @@ void ButtonEventsAttach()
 		{
 			currentServerIndex = (currentServerIndex + 1) % serverList.size();
 			serverUrl = serverList[currentServerIndex];
+			saveConfig();
+			connectAttemptStartMs = millis();
 			Serial.print("Switching WebSocket to: ");
 			Serial.println(serverUrl);
 			webSocket.disconnect();
-			if (WebsocketBegin(serverUrl))
-			{
-				webSocket.onEvent(webSocketEvent);
-				webSocket.setReconnectInterval(5000);
-			}
+			BeginManagedWebSocket(serverUrl);
 		}
 	});
 	buttons[1].setClickMs(10);
@@ -1483,7 +1508,7 @@ uint32_t GetWiFiStatusGlyph()
 
 void DrawServerStatusIcon(uint8_t x, uint8_t baselineY, bool connected)
 {
-	uint8_t top = baselineY >= 7 ? (baselineY - 7) : 0;
+	uint8_t top = baselineY >= 8 ? (baselineY - 8) : 0;
 
 	if (connected)
 	{
@@ -1656,12 +1681,9 @@ void HandleConfig()
 				serverList = newList;
 				currentServerIndex = 0;
 				serverUrl = serverList[currentServerIndex];
+				connectAttemptStartMs = millis();
 				webSocket.disconnect();
-				if (WebsocketBegin(serverUrl))
-				{
-					webSocket.onEvent(webSocketEvent);
-					webSocket.setReconnectInterval(5000);
-				}
+				BeginManagedWebSocket(serverUrl);
 			}
 		}
 
@@ -1830,11 +1852,11 @@ void HandleConfigModern()
 				serverList = newList;
 				currentServerIndex = 0;
 				serverUrl = serverList[currentServerIndex];
+				connectAttemptStartMs = millis();
 				webSocket.disconnect();
-				if (WiFi.isConnected() && WebsocketBegin(serverUrl))
+				if (WiFi.isConnected())
 				{
-					webSocket.onEvent(webSocketEvent);
-					webSocket.setReconnectInterval(5000);
+					BeginManagedWebSocket(serverUrl);
 				}
 			}
 		}
