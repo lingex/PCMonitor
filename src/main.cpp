@@ -124,6 +124,8 @@ String BuildDateLabel();
 bool TryParseTimezoneHours(const String &value, int &parsedHours);
 void ApplyTimeZoneHours(int newTimeZoneHours);
 String HtmlEscape(const String &value);
+uint8_t ClampBacklightPercent(int value);
+uint8_t BacklightPercentToDuty(uint8_t percent);
 void ApplyBacklightState(bool turnOn);
 bool ShouldBacklightBeOnAt(uint16_t currentMins);
 void RefreshBacklightState();
@@ -313,10 +315,25 @@ void ApplyTimeZoneHours(int newTimeZoneHours)
 	}
 }
 
+uint8_t ClampBacklightPercent(int value)
+{
+	if (value < 0)
+		return 0;
+	if (value > 100)
+		return 100;
+	return (uint8_t)value;
+}
+
+uint8_t BacklightPercentToDuty(uint8_t percent)
+{
+	// DIS_BL is active-low: 0 is full brightness, 255 is off.
+	return 255 - (uint8_t)(((uint16_t)percent * 255 + 50) / 100);
+}
+
 void ApplyBacklightState(bool turnOn)
 {
 	backlightOn = turnOn;
-	analogWrite(DIS_BL, turnOn ? (255 - backlightPwm) : 255);
+	analogWrite(DIS_BL, turnOn ? BacklightPercentToDuty(backlightPwm) : 255);
 }
 
 bool ShouldBacklightBeOnAt(uint16_t currentMins)
@@ -353,8 +370,14 @@ void RefreshBacklightState()
 				backlightOnTime % 60,
 				backlightOffTime / 60,
 				backlightOffTime % 60);
-			ApplyBacklightState(shouldBeOn);
 		}
+		ApplyBacklightState(shouldBeOn);
+		return;
+	}
+
+	if (autoBacklightEnabled)
+	{
+		ApplyBacklightState(backlightOn);
 		return;
 	}
 
@@ -564,7 +587,7 @@ void loadConfig()
 	if (doc.containsKey("wifiBand"))
 		wifiBandPreference = WiFiBandPreferenceFromString(doc["wifiBand"].as<String>());
 	if (doc.containsKey("backlight"))
-		backlightPwm = doc["backlight"].as<int>();
+		backlightPwm = ClampBacklightPercent(doc["backlight"].as<int>());
 	if (doc.containsKey("rotation"))
 		lcdRotation = doc["rotation"].as<int>();
 
@@ -744,6 +767,7 @@ void setup()
 	Serial.println("Starting...");
 	pinMode(LED, OUTPUT);
 	digitalWrite(LED, HIGH); // LED ON
+	pinMode(DIS_BL, OUTPUT);
 
 	// Initialize littlefs
 	if (!LittleFS.begin())
@@ -1261,13 +1285,16 @@ void DisplayStatus()
 
 	u8g2.drawHLine(0, 54, 128); // draw a line
 	// HOSTNAME
-	u8g2.setFont(u8g2_font_siji_t_6x10);
+	u8g2.setFont(u8g2_font_5x8_tr);
+	u8g2.setFontPosBottom();
 	u8g2.drawStr(0, 63, String(String("Host:") + host_name).c_str());
 	String dateLabel = BuildDateLabel();
 	int16_t dateX = 128 - u8g2.getStrWidth(dateLabel.c_str());
 	if (dateX < 0)
 		dateX = 0;
 	u8g2.drawStr(dateX, 63, dateLabel.c_str());
+	u8g2.setFontPosBaseline();
+	u8g2.setFont(u8g2_font_siji_t_6x10);
 
 	String idxStr = String("[") + String(currentServerIndex + 1) + String("/") + String(serverList.size()) + String("]");
 	u8g2.drawStr(54, 8, idxStr.c_str());
@@ -1384,7 +1411,7 @@ void saveParamCallback()
 
 	// 将从页面中获取的数据保存
 	lcdRotation = getParam("set_rotation").toInt();
-	backlightPwm = getParam("LCDBL").toInt();
+	backlightPwm = ClampBacklightPercent(getParam("LCDBL").toInt());
 	String bandPref = getParam("wifi_band_pref");
 	if (bandPref.length() > 0)
 		wifiBandPreference = WiFiBandPreferenceFromString(bandPref);
@@ -1599,7 +1626,7 @@ void HandleConfig()
 		// 调整亮度
 		if (web_lcdbl >= 0 && web_lcdbl <= 100)
 		{
-			backlightPwm = web_lcdbl;
+			backlightPwm = ClampBacklightPercent(web_lcdbl);
 			Serial.printf("亮度调整为：");
 			Serial.println(backlightPwm);
 			Serial.println("");
@@ -1798,7 +1825,7 @@ void HandleConfigModern()
 
 		if (web_lcdbl >= 0 && web_lcdbl <= 100)
 		{
-			backlightPwm = web_lcdbl;
+			backlightPwm = ClampBacklightPercent(web_lcdbl);
 		}
 
 		autoBacklightEnabled = server.hasArg("auto_backlight");
