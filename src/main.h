@@ -16,6 +16,8 @@
 #define DIS_SDA 7
 #define DIS_BL 8
 
+#define HW_VERSION "1.2"
+
 struct WifiConfig_t
 {
   char stassid[32];//定义配网得到的WIFI名长度(最大32字节)

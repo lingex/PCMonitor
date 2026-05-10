@@ -44,7 +44,7 @@ std::vector<String> serverList = { serverUrl };
 size_t currentServerIndex = 0;
 uint32_t pendingRestartAtMs = 0;
 
-String hw_ver = "1.2";
+String hw_ver = HW_VERSION;
 String sw_ver = "1.5";
 
 const string ntpServerName = "ntp6.aliyun.com";
@@ -129,6 +129,10 @@ uint8_t BacklightPercentToDuty(uint8_t percent);
 void ApplyBacklightState(bool turnOn);
 bool ShouldBacklightBeOnAt(uint16_t currentMins);
 void RefreshBacklightState();
+
+String FitTextToWidth(String text, uint8_t maxWidth);
+void DrawStatusHeader();
+void DrawMetricRow(uint8_t y, const char *label, uint8_t percent);
 
 // web config
 WiFiManager wifiMgr;
@@ -281,6 +285,22 @@ String DayOrdinalSuffix(int dayOfMonth)
 String BuildDateLabel()
 {
 	return String(monthShortStr(month())) + "," + String(day()) + DayOrdinalSuffix(day());
+}
+
+String FitTextToWidth(String text, uint8_t maxWidth)
+{
+	if (u8g2.getStrWidth(text.c_str()) <= maxWidth)
+		return text;
+
+	const String marker = "~";
+	if (u8g2.getStrWidth(marker.c_str()) > maxWidth)
+		return "";
+
+	while (text.length() > 0 && u8g2.getStrWidth((text + marker).c_str()) > maxWidth)
+	{
+		text.remove(text.length() - 1);
+	}
+	return text + marker;
 }
 
 bool TryParseTimezoneHours(const String &value, int &parsedHours)
@@ -1229,6 +1249,49 @@ void ButtonEventsAttach()
 	});
 }
 
+void DrawStatusHeader()
+{
+	char timeBuf[6];
+	sprintf(timeBuf, "%02d:%02d", hour(), minute());
+
+	u8g2.setFontPosBaseline();
+	u8g2.setFont(u8g2_font_6x10_tr);
+	u8g2.drawStr(0, 8, timeBuf);
+
+	String dateLabel = FitTextToWidth(BuildDateLabel(), 54);
+	int16_t dateX = (128 - u8g2.getStrWidth(dateLabel.c_str())) / 2;
+	if (dateX < 32)
+		dateX = 32;
+	u8g2.drawStr(dateX, 8, dateLabel.c_str());
+
+	u8g2.setFont(u8g2_font_siji_t_6x10);
+	u8g2.drawGlyph(107, 8, GetWiFiStatusGlyph());
+	DrawServerStatusIcon(120, 8, WiFi.isConnected() && webSocket.isConnected());
+	u8g2.drawHLine(0, 10, 128);
+}
+
+void DrawMetricRow(uint8_t y, const char *label, uint8_t percent)
+{
+	const uint8_t barX = 25;
+	const uint8_t barY = y + 4;
+	const uint8_t barW = 64;
+	const uint8_t barH = 10;
+
+	u8g2.setFontPosBaseline();
+	u8g2.setFont(u8g2_font_6x10_tr);
+	u8g2.drawStr(0, y + 11, label);
+
+	u8g2.drawFrame(barX, barY, barW, barH);
+	uint8_t fillW = ((uint16_t)percent * (barW - 2) + 50) / 100;
+	if (fillW > 0)
+		u8g2.drawBox(barX + 1, barY + 1, fillW, barH - 2);
+
+	u8g2.setFont(u8g2_font_7x13B_tr);
+	String value = String(percent) + String("%");
+	int16_t valueX = 128 - u8g2.getStrWidth(value.c_str());
+	u8g2.drawStr(valueX, y + 13, value.c_str());
+}
+
 void DisplayStatus()
 {
 	const int progressBarWidth = 50;
@@ -1281,23 +1344,19 @@ void DisplayStatus()
 	u8g2.drawStr(0, 52, String(String("DN: ") + down).c_str());
 
 #endif
-	DateTime();
+	DrawStatusHeader();
+	//DrawMetricRow(11, "CPU", ClampUsagePercent(cpu_usage));
+	//DrawMetricRow(26, "MEM", ClampUsagePercent(memory_usage));
 
-	u8g2.drawHLine(0, 54, 128); // draw a line
-	// HOSTNAME
-	u8g2.setFont(u8g2_font_5x8_tr);
+
 	u8g2.setFontPosBottom();
-	u8g2.drawStr(0, 63, String(String("Host:") + host_name).c_str());
-	String dateLabel = BuildDateLabel();
-	int16_t dateX = 128 - u8g2.getStrWidth(dateLabel.c_str());
-	if (dateX < 0)
-		dateX = 0;
-	u8g2.drawStr(dateX, 63, dateLabel.c_str());
+	String idxStr = String("[") + String(currentServerIndex + 1) + String("/") + String(serverList.size()) + String("]");
+	int16_t idxWidth = u8g2.getStrWidth(idxStr.c_str());
+	String hostLabel = FitTextToWidth(String("Host:") + host_name, 128 - idxWidth - 4);
+	u8g2.drawStr(0, 63, hostLabel.c_str());
+	u8g2.drawStr(128 - idxWidth, 63, idxStr.c_str());
 	u8g2.setFontPosBaseline();
 	u8g2.setFont(u8g2_font_siji_t_6x10);
-
-	String idxStr = String("[") + String(currentServerIndex + 1) + String("/") + String(serverList.size()) + String("]");
-	u8g2.drawStr(54, 8, idxStr.c_str());
 
 	u8g2.sendBuffer(); // transfer internal memory to the display
 }
@@ -1366,7 +1425,7 @@ void Webconfig()
 	bool res;
 	wifiMgr.setAPStaticIPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
 	// res = wifiMgr.autoConnect("MonitorV1"); // anonymous ap
-	res = wifiMgr.autoConnect("MonitorV1.2", "11111178"); // password protected ap
+	res = wifiMgr.autoConnect(String(String("MonitorV") + hw_ver).c_str(), "11111178"); // password protected ap
 
 	while (!res)
 	{
@@ -1723,7 +1782,7 @@ void HandleConfig()
 
 	// 网页界面代码段 — 显示当前设置并允许修改
 	String content = "<html><style>html,body{ background: #29cbf8ff; color: #fff; font-size: 12px; font-family:Arial,Helvetica,sans-serif;} label{display:block;margin-top:8px;} .small{font-size:11px;color:#eee}</style>";
-	content += "<body><form action='/' method='POST'><br><div style='font-weight:bold;'>Monitor V1.2</div><br>";
+	content += "<body><form action='/' method='POST'><br><div style='font-weight:bold;'>Monitor V" + String(hw_ver) + "</div><br>";
 	// show current wifi SSID (read-only here)
 	content += "<label>WiFi SSID: <span class='small'>" + String(wificonf.stassid) + "</span></label>";
 	content += BuildWiFiBandPreferenceHtml("web_wifi_band");
@@ -1936,7 +1995,7 @@ void HandleConfigModern()
 
 	String content;
 	content.reserve(11000);
-	content += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Monitor V1.2</title>";
+	content += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Monitor V" + String(hw_ver) + "</title>";
 	content += R"rawliteral(
 <style>
 :root{
@@ -2012,7 +2071,7 @@ textarea{min-height:164px;resize:vertical}
 }
 </style></head><body><div class='wrap'>
 )rawliteral";
-	content += "<div class='hero'><h1>Monitor V1.2</h1><div class='hero-tools'><button class='theme-btn' type='button' id='themeToggle'>Dark Theme</button></div></div>";
+	content += "<div class='hero'><h1>Monitor V" + String(hw_ver) + "</h1><div class='hero-tools'><button class='theme-btn' type='button' id='themeToggle'>Dark Theme</button></div></div>";
 	content += statusHtml;
 	content += "<div class='stats'>";
 	content += "<div class='stat'><span class='k'>Status</span><span class='v'>" + HtmlEscape(connectionState) + "</span></div>";
