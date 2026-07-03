@@ -22,3 +22,9 @@ jobs:
 
       - name: Build PlatformIO Project
         run: pio run
+
+      - name: Upload Firmware Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-firmware
+          path: .pio/build/**/firmware.*
