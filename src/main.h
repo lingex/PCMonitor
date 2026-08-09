@@ -5,7 +5,7 @@
 
 /* ------------------------- CUSTOM GPIO PIN MAPPING ------------------------- */
 
-#define KEY_B1 9
+#define KEY_B1 28
 #define KEY_B2 0
 #define LED 10
 #define OT 1

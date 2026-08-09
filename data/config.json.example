@@ -1,6 +1,7 @@
 {
-  "ssid": "your-ssid",
-  "psw": "your-passwd",
+  "mode": "monitor",
+  "ssid": "",
+  "psw": "",
   "wifiBand": "5g",
   "backlight": 50,
   "rotation": 2,

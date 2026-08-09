@@ -7,12 +7,14 @@
 #include <Update.h>
 #include <U8g2lib.h>
 #include <LittleFS.h>
+#include <esp_now.h>
 
 #include <vector>
 #include <map>
 #include <WiFi.h>
 #include <esp_idf_version.h>
 #include <esp_wifi.h>
+#include <esp_system.h>
 
 #include <WebServer.h>
 #include <ESPmDNS.h>
@@ -21,6 +23,7 @@
 #include <TimeLib.h>
 
 #include "main.h"
+#include "Checksum.h"
 
 using namespace std;
 
@@ -45,13 +48,33 @@ size_t currentServerIndex = 0;
 uint32_t pendingRestartAtMs = 0;
 
 String hw_ver = HW_VERSION;
-String sw_ver = "1.5";
+String sw_ver = "1.6";
+
+enum class DeviceMode : uint8_t
+{
+	Monitor,
+	Controller
+};
+
+DeviceMode deviceMode = DeviceMode::Monitor;
+bool controllerEspNowReady = false;
+String lastControllerCommand = "None";
+String lastControllerStatus = "Ready";
+uint32_t controllerCommandSequence = 0;
+uint32_t controllerActionCount = 0;
+uint32_t lastControllerActionMs = 0;
+bool controllerBacklightWakeActive = false;
+uint32_t controllerBacklightWakeUntilMs = 0;
+constexpr uint8_t kEspNowBroadcastAddress[] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+constexpr size_t kConfigFileMaxSize = 4096;
+constexpr uint8_t kControllerWakeBacklightPercent = 30;
+constexpr uint32_t kControllerWakeBacklightMs = 3000;
+constexpr uint32_t kControllerActionHighlightMs = 900;
 
 const string ntpServerName = "ntp6.aliyun.com";
 int timeZoneHours = 8;
 unsigned int localPort = 8000;
 
-constexpr bool kWifiDisablePowerSave = true;
 constexpr bool kWifiForceHt20 = true;
 constexpr wifi_power_t kWifiTxPower = WIFI_POWER_20dBm;
 constexpr uint32_t kWifiConnectTimeoutMs = 20000;
@@ -97,6 +120,7 @@ void ButtonEventsAttach();
 void Webconfig();
 void SetLcdRotation(int val);
 void DisplayStatus();
+void DisplayControllerStatus();
 void DisplayOTAStatus();
 void DisplayBootWifiInfo();
 bool BeginManagedWebSocket(const String &url);
@@ -129,6 +153,17 @@ uint8_t BacklightPercentToDuty(uint8_t percent);
 void ApplyBacklightState(bool turnOn);
 bool ShouldBacklightBeOnAt(uint16_t currentMins);
 void RefreshBacklightState();
+void WakeControllerBacklightIfNeeded();
+const char *DeviceModeName(DeviceMode mode);
+bool ParseDeviceMode(const String &value, DeviceMode &mode);
+bool IsControllerMode();
+void SetupControllerEspNow();
+bool SendControllerCommand(const char *command);
+void HandleControllerCommand();
+void HandleModeToggle();
+void HandleConfigFileGet();
+void HandleConfigFileSave();
+void HandleRestart();
 
 String FitTextToWidth(String text, uint8_t maxWidth);
 void DrawStatusHeader();
@@ -140,6 +175,34 @@ WiFiManager wifiMgr;
 // 如开启WEB配网则可不用设置这里的参数，前一个为wifi ssid，后一个为密码
 WifiConfig_t wificonf = {{""}, {""}};
 WiFiBandPreference wifiBandPreference = WiFiBandPreference::Only5G;
+
+const char *DeviceModeName(DeviceMode mode)
+{
+	return mode == DeviceMode::Controller ? "controller" : "monitor";
+}
+
+bool ParseDeviceMode(const String &value, DeviceMode &mode)
+{
+	String normalized = value;
+	normalized.trim();
+	normalized.toLowerCase();
+	if (normalized == "monitor")
+	{
+		mode = DeviceMode::Monitor;
+		return true;
+	}
+	if (normalized == "controller")
+	{
+		mode = DeviceMode::Controller;
+		return true;
+	}
+	return false;
+}
+
+bool IsControllerMode()
+{
+	return deviceMode == DeviceMode::Controller;
+}
 
 static const char *WiFiBandName(wifi_band_t band)
 {
@@ -356,6 +419,19 @@ void ApplyBacklightState(bool turnOn)
 	analogWrite(DIS_BL, turnOn ? BacklightPercentToDuty(backlightPwm) : 255);
 }
 
+void WakeControllerBacklightIfNeeded()
+{
+	if (!IsControllerMode() || (backlightOn && backlightPwm > 0))
+		return;
+
+	controllerBacklightWakeActive = true;
+	controllerBacklightWakeUntilMs = millis() + kControllerWakeBacklightMs;
+	// Do not change backlightOn here: it records the state that must be
+	// restored when the temporary wake period expires.
+	analogWrite(DIS_BL, BacklightPercentToDuty(kControllerWakeBacklightPercent));
+	Serial.println("[Backlight] temporary controller wake at 30% for 3 seconds");
+}
+
 bool ShouldBacklightBeOnAt(uint16_t currentMins)
 {
 	if (backlightOnTime == backlightOffTime)
@@ -374,6 +450,18 @@ bool ShouldBacklightBeOnAt(uint16_t currentMins)
 
 void RefreshBacklightState()
 {
+	if (controllerBacklightWakeActive)
+	{
+		if ((int32_t)(controllerBacklightWakeUntilMs - millis()) > 0)
+		{
+			analogWrite(DIS_BL, BacklightPercentToDuty(kControllerWakeBacklightPercent));
+			return;
+		}
+		controllerBacklightWakeActive = false;
+		controllerBacklightWakeUntilMs = 0;
+		Serial.println("[Backlight] temporary controller wake ended");
+	}
+
 	if (autoBacklightEnabled && timeStatus() == timeSet)
 	{
 		time_t nowTime = ::now();
@@ -484,9 +572,16 @@ void ConfigureWiFiRadio()
 	WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
 	WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
 
-	if (kWifiDisablePowerSave)
+	const wifi_ps_type_t wifiPowerSaveMode = IsControllerMode() ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE;
+	if (!WiFi.setSleep(wifiPowerSaveMode))
 	{
-		WiFi.setSleep(false);
+		Serial.printf("[WiFi] failed to set power save mode to %d\n", (int)wifiPowerSaveMode);
+	}
+	else
+	{
+		Serial.printf(
+			"[WiFi] power save: %s\n",
+			wifiPowerSaveMode == WIFI_PS_MIN_MODEM ? "WIFI_PS_MIN_MODEM" : "WIFI_PS_NONE");
 	}
 
 	if (!WiFi.setTxPower(kWifiTxPower))
@@ -496,7 +591,9 @@ void ConfigureWiFiRadio()
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 2) && SOC_WIFI_SUPPORT_5G
 	wifi_band_mode_t bandMode = WIFI_BAND_MODE_AUTO;
-	switch (wifiBandPreference)
+	// IRStation uses an ESP32-C3, so controller mode must stay on 2.4 GHz.
+	WiFiBandPreference effectiveBandPreference = IsControllerMode() ? WiFiBandPreference::Only2G : wifiBandPreference;
+	switch (effectiveBandPreference)
 	{
 	case WiFiBandPreference::Only2G:
 		bandMode = WIFI_BAND_MODE_2G_ONLY;
@@ -511,7 +608,7 @@ void ConfigureWiFiRadio()
 	}
 	if (!WiFi.setBandMode(bandMode))
 	{
-		Serial.printf("[WiFi] failed to set band mode to %s\n", WiFiBandPreferenceLabel(wifiBandPreference));
+		Serial.printf("[WiFi] failed to set band mode to %s\n", WiFiBandPreferenceLabel(effectiveBandPreference));
 	}
 #endif
 
@@ -523,10 +620,11 @@ void ConfigureWiFiRadio()
 	LogWiFiLinkState("radio configured");
 }
 
-// Save run-time configuration (wifi, backlight, rotation, servers) as JSON into littlefs
+// Save run-time configuration (mode, wifi, backlight, rotation, servers) as JSON into littlefs
 void saveConfig()
 {
-	DynamicJsonDocument doc(1024);
+	DynamicJsonDocument doc(1536);
+	doc["mode"] = DeviceModeName(deviceMode);
 	doc["ssid"] = String(wificonf.stassid);
 	doc["psw"] = String(wificonf.stapsw);
 	doc["wifiBand"] = WiFiBandPreferenceKey(wifiBandPreference);
@@ -584,13 +682,23 @@ void loadConfig()
 		return;
 	}
 
-	DynamicJsonDocument doc(1024);
+	DynamicJsonDocument doc(kConfigFileMaxSize);
 	DeserializationError err = deserializeJson(doc, buf.c_str());
 	if (err)
 	{
 		Serial.print("Failed to parse config JSON: ");
 		Serial.println(err.c_str());
 		return;
+	}
+
+	if (doc.containsKey("mode"))
+	{
+		DeviceMode loadedMode;
+		String modeValue = doc["mode"].as<String>();
+		if (ParseDeviceMode(modeValue, loadedMode))
+			deviceMode = loadedMode;
+		else
+			Serial.println("Invalid mode in config; using monitor");
 	}
 
 	// wifi
@@ -651,6 +759,8 @@ void loadConfig()
 	}
 
 	Serial.println("Config loaded from littlefs:");
+	Serial.print("Mode:");
+	Serial.println(DeviceModeName(deviceMode));
 	Serial.print("SSID:");
 	Serial.println(wificonf.stassid);
 	Serial.print("WiFi band pref:");
@@ -668,6 +778,127 @@ void loadConfig()
 		Serial.print(s);
 	}
 	Serial.println("");
+}
+
+void SetupControllerEspNow()
+{
+	controllerEspNowReady = false;
+	if (!IsControllerMode())
+		return;
+
+	const esp_err_t initResult = esp_now_init();
+	if (initResult != ESP_OK)
+	{
+		lastControllerStatus = "ESP-NOW init error " + String((int)initResult);
+		Serial.println(lastControllerStatus);
+		return;
+	}
+
+	// This device only transmits ESP-NOW commands. Disable the default RX wake
+	// window so it does not keep the radio awake while waiting for packets.
+	const esp_err_t wakeWindowResult = esp_now_set_wake_window(0);
+	if (wakeWindowResult != ESP_OK)
+	{
+		Serial.printf("[Controller] failed to disable ESP-NOW RX wake window: %d\n", (int)wakeWindowResult);
+	}
+	else
+	{
+		Serial.println("[Controller] ESP-NOW RX wake window disabled");
+	}
+
+	esp_now_peer_info_t peer = {};
+	memcpy(peer.peer_addr, kEspNowBroadcastAddress, sizeof(kEspNowBroadcastAddress));
+	peer.channel = 0; // Follow the channel used by the current WiFi connection.
+	peer.ifidx = WIFI_IF_STA;
+	peer.encrypt = false;
+	if (!esp_now_is_peer_exist(kEspNowBroadcastAddress))
+	{
+		const esp_err_t peerResult = esp_now_add_peer(&peer);
+		if (peerResult != ESP_OK)
+		{
+			lastControllerStatus = "ESP-NOW peer error " + String((int)peerResult);
+			Serial.println(lastControllerStatus);
+			return;
+		}
+	}
+
+	controllerEspNowReady = true;
+	lastControllerStatus = "Ready on channel " + String((long)WiFi.channel());
+	Serial.println("[Controller] " + lastControllerStatus);
+}
+
+bool SendControllerCommand(const char *command)
+{
+	if (!IsControllerMode())
+	{
+		lastControllerStatus = "Not in controller mode";
+		return false;
+	}
+
+	WakeControllerBacklightIfNeeded();
+	controllerActionCount++;
+	lastControllerActionMs = millis();
+	lastControllerCommand = command;
+	lastControllerStatus = "Sending...";
+	// Draw immediately so a physical click produces visible feedback before
+	// the three ESP-NOW transmissions are queued.
+	DisplayControllerStatus();
+
+	if (!controllerEspNowReady)
+	{
+		lastControllerStatus = "ESP-NOW is not ready";
+		forceStatusRefresh = true;
+		return false;
+	}
+	if (strcmp(command, "weekday") != 0 && strcmp(command, "weekend") != 0)
+	{
+		lastControllerStatus = "Unsupported command";
+		forceStatusRefresh = true;
+		return false;
+	}
+
+	DynamicJsonDocument doc(256);
+	doc["to"] = "all";
+	doc["uid"] = String((uint32_t)esp_random(), HEX) + "-" + String(millis(), HEX) + "-" + String(++controllerCommandSequence, HEX);
+	doc["cmd"] = command;
+	doc["id"] = "PCMonitor-" + String(HW_VERSION);
+	const String checksum = commandChecksum(doc);
+	if (!checksum.length())
+	{
+		lastControllerStatus = "Checksum failed";
+		forceStatusRefresh = true;
+		return false;
+	}
+	doc["chk"] = checksum;
+
+	String payload;
+	serializeJson(doc, payload);
+	esp_err_t sendResult = ESP_FAIL;
+	uint8_t queuedCount = 0;
+	// Repeating with the same UID improves broadcast reliability. IRStation's
+	// duplicate filter guarantees that the command is executed only once.
+	for (uint8_t attempt = 0; attempt < 3; ++attempt)
+	{
+		sendResult = esp_now_send(kEspNowBroadcastAddress,
+			reinterpret_cast<const uint8_t *>(payload.c_str()), payload.length());
+		if (sendResult == ESP_OK)
+			queuedCount++;
+		if (attempt < 2)
+			delay(18);
+	}
+
+	if (queuedCount == 0)
+	{
+		lastControllerStatus = "Send error " + String((int)sendResult);
+		Serial.printf("[Controller] send failed (%d): %s\n", (int)sendResult, payload.c_str());
+		forceStatusRefresh = true;
+		return false;
+	}
+
+	lastControllerStatus = "Queued " + String(queuedCount) + "/3";
+	Serial.printf("[Controller] %s: %s\n", lastControllerStatus.c_str(), payload.c_str());
+	forceStatusRefresh = true;
+	return true;
 }
 
 bool WebsocketBegin(String url)
@@ -806,7 +1037,7 @@ void setup()
 	u8g2.setContrast(15); // 对比度
 	// u8g2.setDisplayRotation(U8G2_R2);
 	u8g2.setFont(u8g2_font_ncenB08_tf);
-	u8g2.drawStr(15, 20, "PC Monitor");
+	u8g2.drawStr(15, 20, IsControllerMode() ? "ESP-NOW Remote" : "PC Monitor");
 
 	u8g2.setFont(u8g2_font_siji_t_6x10);
 	u8g2.drawStr(15, 36, String(String("Hw: ") + hw_ver + String(", Sw: ") + sw_ver).c_str());
@@ -841,6 +1072,9 @@ void setup()
 		Udp.begin(localPort);
 		setSyncProvider(GetNtpTime);
 		setSyncInterval(3600);
+
+		if (IsControllerMode())
+			SetupControllerEspNow();
 
 		WebSeverInit();
 
@@ -1090,7 +1324,7 @@ bindUploader('filesystemBtn','filesystemFile','filesystem','filesystemBar','file
 		forceStatusRefresh = true;
 	}
 
-	if (WiFi.isConnected() && !serverList.empty())
+	if (!IsControllerMode() && WiFi.isConnected() && !serverList.empty())
 	{
 		serverUrl = serverList[currentServerIndex];
 		if (!serverUrl.isEmpty())
@@ -1155,7 +1389,7 @@ void loop()
 		}
 	}
 
-	if (WiFi.isConnected() && !serverUrl.isEmpty() && !webSocket.isConnected())
+	if (!IsControllerMode() && WiFi.isConnected() && !serverUrl.isEmpty() && !webSocket.isConnected())
 	{
 		if (connectAttemptStartMs == 0)
 		{
@@ -1188,7 +1422,7 @@ void loop()
 	if (WiFi.isConnected())
 	{
 		// If OTA is running, avoid starting new websocket activity that might interfere
-		if (!otaUpdating)
+		if (!IsControllerMode() && !otaUpdating)
 		{
 			bool allowWebSocketLoop = webSocket.isConnected() || !IsWebSocketReconnectPaused(curMs);
 			if (allowWebSocketLoop)
@@ -1212,6 +1446,11 @@ void ButtonEventsAttach()
 	}
 	// B1
 	buttons[0].attachClick([]{
+		if (IsControllerMode())
+		{
+			SendControllerCommand("weekday");
+			return;
+		}
 		PauseWebSocketReconnect();
 		bl_switch = !bl_switch;
 		if (bl_switch)
@@ -1226,6 +1465,11 @@ void ButtonEventsAttach()
 	buttons[0].setClickMs(10);
 	// B2
 	buttons[1].attachClick([]{
+		if (IsControllerMode())
+		{
+			SendControllerCommand("weekend");
+			return;
+		}
 		// short press: cycle through configured websocket servers
 		if (serverList.size() > 0)
 		{
@@ -1266,7 +1510,7 @@ void DrawStatusHeader()
 
 	u8g2.setFont(u8g2_font_siji_t_6x10);
 	u8g2.drawGlyph(107, 8, GetWiFiStatusGlyph());
-	DrawServerStatusIcon(120, 8, WiFi.isConnected() && webSocket.isConnected());
+	DrawServerStatusIcon(120, 8, IsControllerMode() ? controllerEspNowReady : (WiFi.isConnected() && webSocket.isConnected()));
 	u8g2.drawHLine(0, 10, 128);
 }
 
@@ -1294,6 +1538,12 @@ void DrawMetricRow(uint8_t y, const char *label, uint8_t percent)
 
 void DisplayStatus()
 {
+	if (IsControllerMode())
+	{
+		DisplayControllerStatus();
+		return;
+	}
+
 	const int progressBarWidth = 50;
 	const int progressBarHeigh = 9;
 
@@ -1359,6 +1609,62 @@ void DisplayStatus()
 	u8g2.setFont(u8g2_font_siji_t_6x10);
 
 	u8g2.sendBuffer(); // transfer internal memory to the display
+}
+
+void DisplayControllerStatus()
+{
+	u8g2.clearBuffer();
+	DrawStatusHeader();
+	u8g2.setFontPosBaseline();
+
+	const bool hasAction = controllerActionCount > 0;
+	String actionLabel = hasAction ? lastControllerCommand : String("READY");
+	actionLabel.toUpperCase();
+	String sequenceLabel = hasAction ? String("#") + String(controllerActionCount) : String();
+	const bool highlightAction = hasAction && (millis() - lastControllerActionMs < kControllerActionHighlightMs);
+	if (highlightAction)
+	{
+		u8g2.drawBox(0, 14, 128, 23);
+		u8g2.setDrawColor(0);
+	}
+	else
+	{
+		u8g2.drawFrame(0, 14, 128, 23);
+	}
+
+	u8g2.setFont(u8g2_font_7x13B_tr);
+	u8g2.drawStr(3, 31, actionLabel.c_str());
+	if (sequenceLabel.length())
+	{
+		u8g2.setFont(u8g2_font_6x10_tr);
+		int16_t sequenceX = 125 - u8g2.getStrWidth(sequenceLabel.c_str());
+		u8g2.drawStr(sequenceX > 3 ? sequenceX : 3, 30, sequenceLabel.c_str());
+	}
+	u8g2.setDrawColor(1);
+
+	u8g2.setFont(u8g2_font_6x10_tr);
+	String leftStatus;
+	const bool commandQueued = lastControllerStatus.startsWith("Queued");
+	if (hasAction && !commandQueued)
+	{
+		leftStatus = lastControllerStatus;
+		leftStatus.toUpperCase();
+	}
+	else
+	{
+		leftStatus = WiFi.isConnected() ? WiFi.localIP().toString() : String("NO IP");
+	}
+	String channelLabel = String("CH ") + String((long)WiFi.channel());
+	const int16_t channelWidth = u8g2.getStrWidth(channelLabel.c_str());
+	leftStatus = FitTextToWidth(leftStatus, 128 - channelWidth - 6);
+	u8g2.drawStr(0, 49, leftStatus.c_str());
+	u8g2.drawStr(128 - channelWidth, 49, channelLabel.c_str());
+
+	u8g2.drawHLine(0, 52, 128);
+	const char *buttonHint = "WEEKDAY / WEEKEND";
+	int16_t hintX = (128 - u8g2.getStrWidth(buttonHint)) / 2;
+	u8g2.drawStr(hintX > 0 ? hintX : 0, 63, buttonHint);
+	u8g2.sendBuffer();
 }
 
 // WEB配网函数
@@ -1664,6 +1970,192 @@ void DisplayBootWifiInfo()
 	u8g2.sendBuffer();
 }
 
+void SendApiError(int statusCode, const String &message)
+{
+	DynamicJsonDocument doc(256);
+	doc["ok"] = false;
+	doc["error"] = message;
+	String response;
+	serializeJson(doc, response);
+	server.sendHeader("Cache-Control", "no-store");
+	server.send(statusCode, "application/json", response);
+}
+
+void HandleControllerCommand()
+{
+	if (!IsControllerMode())
+	{
+		SendApiError(409, "Device is not running in controller mode");
+		return;
+	}
+
+	String command = server.arg("cmd");
+	command.trim();
+	command.toLowerCase();
+	if (command != "weekday" && command != "weekend")
+	{
+		SendApiError(400, "cmd must be weekday or weekend");
+		return;
+	}
+
+	const bool queued = SendControllerCommand(command.c_str());
+	DynamicJsonDocument doc(384);
+	doc["ok"] = queued;
+	doc["cmd"] = command;
+	doc["status"] = lastControllerStatus;
+	doc["channel"] = (long)WiFi.channel();
+	String response;
+	serializeJson(doc, response);
+	server.sendHeader("Cache-Control", "no-store");
+	server.send(queued ? 200 : 503, "application/json", response);
+}
+
+void HandleModeToggle()
+{
+	deviceMode = IsControllerMode() ? DeviceMode::Monitor : DeviceMode::Controller;
+	saveConfig();
+
+	DynamicJsonDocument doc(192);
+	doc["ok"] = true;
+	doc["mode"] = DeviceModeName(deviceMode);
+	doc["restarting"] = true;
+	String response;
+	serializeJson(doc, response);
+	server.sendHeader("Cache-Control", "no-store");
+	server.send(200, "application/json", response);
+	pendingRestartAtMs = millis() + 800;
+}
+
+void HandleConfigFileGet()
+{
+	if (!LittleFS.exists(CONFIG_FILE_PATH))
+	{
+		SendApiError(404, "config.json does not exist");
+		return;
+	}
+
+	File file = LittleFS.open(CONFIG_FILE_PATH, "r");
+	if (!file)
+	{
+		SendApiError(500, "Unable to read config.json");
+		return;
+	}
+	if (file.size() > kConfigFileMaxSize)
+	{
+		file.close();
+		SendApiError(413, "config.json is too large");
+		return;
+	}
+	String content = file.readString();
+	file.close();
+	server.sendHeader("Cache-Control", "no-store");
+	server.send(200, "application/json; charset=utf-8", content);
+}
+
+void HandleConfigFileSave()
+{
+	const String body = server.arg("plain");
+	if (!body.length())
+	{
+		SendApiError(400, "Config JSON body is empty");
+		return;
+	}
+	if (body.length() > kConfigFileMaxSize)
+	{
+		SendApiError(413, "Config JSON is too large");
+		return;
+	}
+
+	DynamicJsonDocument doc(kConfigFileMaxSize);
+	const DeserializationError error = deserializeJson(doc, body);
+	if (error)
+	{
+		SendApiError(400, "Invalid config JSON: " + String(error.c_str()));
+		return;
+	}
+	if (!doc.is<JsonObject>())
+	{
+		SendApiError(400, "Config JSON root must be an object");
+		return;
+	}
+
+	DeviceMode requestedMode = deviceMode;
+	if (doc.containsKey("mode") && !ParseDeviceMode(doc["mode"].as<String>(), requestedMode))
+	{
+		SendApiError(400, "mode must be monitor or controller");
+		return;
+	}
+
+	const DeviceMode activeMode = deviceMode;
+	const String oldSsid = String(wificonf.stassid);
+	const String oldPassword = String(wificonf.stapsw);
+	const WiFiBandPreference oldBandPreference = wifiBandPreference;
+	const char *tempPath = "/config.json.tmp";
+	const char *backupPath = "/config.json.bak";
+	LittleFS.remove(tempPath);
+	LittleFS.remove(backupPath);
+	File file = LittleFS.open(tempPath, "w");
+	if (!file)
+	{
+		SendApiError(500, "Unable to stage config.json");
+		return;
+	}
+	const size_t written = file.print(body);
+	file.close();
+	if (written != body.length())
+	{
+		LittleFS.remove(tempPath);
+		SendApiError(500, "Unable to write the complete config.json");
+		return;
+	}
+
+	// The document has already been validated. Keep the previous file as a
+	// rollback copy until the staged file has been activated successfully.
+	const bool hadPreviousConfig = LittleFS.exists(CONFIG_FILE_PATH);
+	if (hadPreviousConfig && !LittleFS.rename(CONFIG_FILE_PATH, backupPath))
+	{
+		LittleFS.remove(tempPath);
+		SendApiError(500, "Unable to back up the current config.json");
+		return;
+	}
+	if (!LittleFS.rename(tempPath, CONFIG_FILE_PATH))
+	{
+		LittleFS.remove(tempPath);
+		if (hadPreviousConfig)
+			LittleFS.rename(backupPath, CONFIG_FILE_PATH);
+		SendApiError(500, "Unable to activate the staged config.json");
+		return;
+	}
+	LittleFS.remove(backupPath);
+
+	loadConfig();
+	const bool restartRequired = requestedMode != activeMode ||
+		oldSsid != String(wificonf.stassid) || oldPassword != String(wificonf.stapsw) ||
+		oldBandPreference != wifiBandPreference;
+	// Mode selection is intentionally applied only during startup. Keep the
+	// active runtime branch stable until the user restarts the device.
+	deviceMode = activeMode;
+	SetLcdRotation(lcdRotation);
+	RefreshBacklightState();
+	forceStatusRefresh = true;
+
+	DynamicJsonDocument responseDoc(256);
+	responseDoc["ok"] = true;
+	responseDoc["mode"] = DeviceModeName(requestedMode);
+	responseDoc["restartRequired"] = restartRequired;
+	String response;
+	serializeJson(responseDoc, response);
+	server.sendHeader("Cache-Control", "no-store");
+	server.send(200, "application/json", response);
+}
+
+void HandleRestart()
+{
+	server.sendHeader("Cache-Control", "no-store");
+	server.send(200, "application/json", "{\"ok\":true,\"restarting\":true}");
+	pendingRestartAtMs = millis() + 800;
+}
+
 void HandleConfig()
 {
 	String msg;
@@ -1938,11 +2430,12 @@ void HandleConfigModern()
 				serverList = newList;
 				currentServerIndex = 0;
 				serverUrl = serverList[currentServerIndex];
-				connectAttemptStartMs = millis();
-				webSocket.disconnect();
-				if (WiFi.isConnected())
+				if (!IsControllerMode())
 				{
-					BeginManagedWebSocket(serverUrl);
+					connectAttemptStartMs = millis();
+					webSocket.disconnect();
+					if (WiFi.isConnected())
+						BeginManagedWebSocket(serverUrl);
 				}
 			}
 		}
@@ -1976,6 +2469,9 @@ void HandleConfigModern()
 	String mac = HtmlEscape(GetESPMACAddress());
 	String activeServer = (!serverList.empty() && currentServerIndex < serverList.size()) ? HtmlEscape(serverList[currentServerIndex]) : String("-");
 	String connectionState = WiFi.isConnected() ? String("Online") : String("Offline");
+	String modeName = String(DeviceModeName(deviceMode));
+	String modeTitle = IsControllerMode() ? String("Controller") : String("Monitor");
+	String modeToggleLabel = IsControllerMode() ? String("Switch to Monitor") : String("Switch to Controller");
 	String bandPref = String(WiFiBandPreferenceKey(wifiBandPreference));
 	String timeZoneLabel = String(timeZoneHours);
 
@@ -1994,8 +2490,8 @@ void HandleConfigModern()
 	sprintf(offTimeStr, "%02d:%02d", backlightOffTime / 60, backlightOffTime % 60);
 
 	String content;
-	content.reserve(11000);
-	content += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Monitor V" + String(hw_ver) + "</title>";
+	content.reserve(18000);
+	content += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>" + modeTitle + " V" + String(hw_ver) + "</title>";
 	content += R"rawliteral(
 <style>
 :root{
@@ -2019,7 +2515,8 @@ body{padding:28px 18px 40px}
 .hero{padding:24px 28px;border:1px solid var(--card-border);border-radius:28px;background:linear-gradient(135deg,var(--hero-start),var(--hero-end));box-shadow:var(--shadow);display:flex;align-items:center;justify-content:space-between;gap:16px}
 .hero h1{margin:0;font-size:32px;letter-spacing:.02em}
 .hero-tools{display:flex;align-items:center;gap:12px}
-.theme-btn{padding:12px 16px;border-radius:16px;border:1px solid var(--surface-border);background:var(--surface);color:var(--text);cursor:pointer;font-weight:600}
+.theme-btn,.mode-btn{padding:12px 16px;border-radius:16px;border:1px solid var(--surface-border);background:var(--surface);color:var(--text);cursor:pointer;font-weight:600}
+.mode-btn{background:linear-gradient(135deg,var(--accent),#4cb4ff);color:#03111e;border:none}
 .banner{margin:18px 0;padding:14px 16px;border-radius:16px;font-size:14px}
 .banner.ok{background:rgba(126,240,184,.14);border:1px solid rgba(126,240,184,.28)}
 .banner.warn{background:rgba(255,209,102,.12);border:1px solid rgba(255,209,102,.28)}
@@ -2041,6 +2538,7 @@ input[type=text],input[type=password],input[type=number],textarea{
 }
 input:focus,textarea:focus{border-color:rgba(82,212,255,.55);box-shadow:0 0 0 4px rgba(82,212,255,.12)}
 textarea{min-height:164px;resize:vertical}
+#configEditor{min-height:340px;font-family:Consolas,"SFMono-Regular",monospace;font-size:13px;line-height:1.55;tab-size:2}
 .inline{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .toggle{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:16px;background:var(--surface);border:1px solid var(--surface-border)}
 .toggle input{width:18px;height:18px}
@@ -2060,6 +2558,13 @@ textarea{min-height:164px;resize:vertical}
 .meta strong{display:block;color:var(--text);font-size:15px;line-height:1.55;font-weight:600;word-break:break-word;overflow-wrap:anywhere}
 .actions{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:22px;padding:18px 22px;border-radius:24px;background:var(--surface);border:1px solid var(--surface-border)}
 .primary{padding:15px 24px;border:none;border-radius:18px;background:linear-gradient(135deg,var(--accent),#4cb4ff);color:#03111e;font-size:15px;font-weight:700;cursor:pointer}
+.controller-actions,.config-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}
+.control-btn,.editor-btn{padding:13px 18px;border-radius:16px;border:1px solid var(--surface-border);background:var(--surface);color:var(--text);cursor:pointer;font-weight:700}
+.control-btn{flex:1;min-width:150px;background:linear-gradient(135deg,var(--accent-2),#57d29d);color:#03140f;border:none}
+.config-file-card{margin-top:18px}.config-head{display:flex;align-items:center;justify-content:space-between;gap:14px}.config-head h2{margin:0}
+.config-editor[hidden]{display:none}.config-status{min-height:20px;margin-top:10px;color:var(--muted);font-size:13px}.config-status.ok{color:var(--accent-2)}.config-status.error{color:#e85d75}
+.control-status{margin-top:12px;color:var(--muted);font-size:13px;min-height:20px}
+.control-btn:disabled,.editor-btn:disabled,.mode-btn:disabled{opacity:.55;cursor:not-allowed}
 .link{color:var(--accent-2);text-decoration:none;font-weight:600}
 .small{color:var(--muted);font-size:12px}
 @media (max-width:720px){
@@ -2067,19 +2572,28 @@ textarea{min-height:164px;resize:vertical}
   .hero h1{font-size:26px}
   .inline,.meta,.radio-grid,.radio-grid-4,.actions{grid-template-columns:1fr}
   .actions{justify-items:stretch}
-  .primary,.ghost,.theme-btn{width:100%}
+  .primary,.ghost,.theme-btn,.mode-btn{width:100%}
+  .hero-tools,.config-head{width:100%;flex-direction:column;align-items:stretch}
 }
 </style></head><body><div class='wrap'>
 )rawliteral";
-	content += "<div class='hero'><h1>Monitor V" + String(hw_ver) + "</h1><div class='hero-tools'><button class='theme-btn' type='button' id='themeToggle'>Dark Theme</button></div></div>";
+	content += "<div class='hero'><h1>" + modeTitle + " V" + String(hw_ver) + "</h1><div class='hero-tools'><button class='mode-btn' type='button' id='modeToggle'>" + modeToggleLabel + "</button><button class='theme-btn' type='button' id='themeToggle'>Dark Theme</button></div></div>";
 	content += statusHtml;
 	content += "<div class='stats'>";
 	content += "<div class='stat'><span class='k'>Status</span><span class='v'>" + HtmlEscape(connectionState) + "</span></div>";
 	content += "<div class='stat'><span class='k'>IP</span><span class='v'>" + ipAddress + "</span></div>";
 	content += "<div class='stat'><span class='k'>Band</span><span class='v'>" + band + "</span></div>";
 	content += "<div class='stat'><span class='k'>RSSI</span><span class='v'>" + rssi + "</span></div>";
+	content += "<div class='stat'><span class='k'>Mode</span><span class='v'>" + HtmlEscape(modeName) + "</span></div>";
 	content += "</div>";
 	content += "<form action='/' method='POST'><input type='hidden' name='Save' value='1'><div class='grid'>";
+
+	if (IsControllerMode())
+	{
+		content += "<section class='card'><h2>IRStation Remote</h2><p>Send the same preset commands as the physical B1 and B2 buttons. Broadcasts use the current 2.4 GHz WiFi channel.</p>";
+		content += "<div class='controller-actions'><button class='control-btn' type='button' data-command='weekday'>Workday (B1)</button><button class='control-btn' type='button' data-command='weekend'>Weekend (B2)</button></div>";
+		content += "<div class='control-status' id='controlStatus'>" + HtmlEscape(lastControllerStatus) + "</div></section>";
+	}
 
 	content += "<section class='card'><h2>WiFi</h2><p>Client credentials and preferred radio band. WiFi changes reboot the device to reconnect cleanly.</p>";
 	content += "<div class='field'><label for='web_ssid'>SSID</label><input id='web_ssid' type='text' name='web_ssid' maxlength='31' value='" + currentSsid + "' autocomplete='off'></div>";
@@ -2097,14 +2611,14 @@ textarea{min-height:164px;resize:vertical}
 	if (bandPref == "auto")
 		content += " checked";
 	content += "><span class='choice'>Auto</span></label>";
-	content += "</div></div></section>";
+	content += "</div><div class='hint'>Controller mode always uses 2.4 GHz so it can reach the ESP32-C3 receiver.</div></div></section>";
 
 	content += "<section class='card'><h2>Device</h2><p>Live connection details and firmware identity.</p><div class='meta'>";
 	content += "<div class='meta-item'><span>Hostname</span><strong>" + hostname + "</strong></div>";
 	content += "<div class='meta-item'><span>MAC</span><strong>" + mac + "</strong></div>";
 	content += "<div class='meta-item'><span>BSSID</span><strong>" + bssid + "</strong></div>";
 	content += "<div class='meta-item'><span>Channel</span><strong>" + channel + "</strong></div>";
-	content += "<div class='meta-item wide'><span>WebSocket</span><strong>" + activeServer + "</strong></div>";
+	content += "<div class='meta-item wide'><span>" + String(IsControllerMode() ? "ESP-NOW" : "WebSocket") + "</span><strong>" + String(IsControllerMode() ? HtmlEscape(lastControllerStatus) : activeServer) + "</strong></div>";
 	content += "<div class='meta-item'><span>Version</span><strong>HW " + HtmlEscape(hw_ver) + " / SW " + HtmlEscape(sw_ver) + "</strong></div>";
 	content += "</div></section>";
 
@@ -2146,6 +2660,8 @@ textarea{min-height:164px;resize:vertical}
 
 	content += "</div>";
 	content += "<div class='actions'><div><div>Firmware upload</div><div class='small'>Use the integrated <a class='link' href='/update'>web updater</a> to flash a new firmware binary.</div></div><button class='primary' type='submit'>Save Configuration</button></div></form>";
+	content += "<section class='card config-file-card'><div class='config-head'><div><h2>Configuration File</h2><p>Directly edit /config.json. JSON is validated before it is written.</p></div><button class='editor-btn' type='button' id='toggleConfigFile'>Edit config.json</button></div>";
+	content += "<div class='config-editor' id='configEditorWrap' hidden><textarea id='configEditor' aria-label='config.json editor' spellcheck='false'></textarea><div class='config-status' id='configStatus'>Not loaded</div><div class='config-actions'><button class='editor-btn' type='button' id='formatConfig'>Check &amp; format</button><button class='editor-btn' type='button' id='reloadConfigFile'>Reload file</button><button class='editor-btn' type='button' id='saveConfigFile'>Save configuration</button><button class='editor-btn' type='button' id='restartDevice'>Restart device</button></div></div></section>";
 	content += R"rawliteral(
 <script>
 const root=document.documentElement;
@@ -2162,6 +2678,111 @@ if(themeToggle){
     updateThemeButton();
   });
 }
+async function apiRequest(url,options={}){
+  const response=await fetch(url,options);
+  const text=await response.text();
+  let data={};
+  try{data=text?JSON.parse(text):{};}catch(error){data={error:text||('HTTP '+response.status)};}
+  if(!response.ok||data.ok===false)throw new Error(data.error||data.status||('HTTP '+response.status));
+  return data;
+}
+const modeToggle=document.getElementById('modeToggle');
+if(modeToggle){
+  modeToggle.addEventListener('click',async()=>{
+    if(!confirm('Switch device mode and restart now?'))return;
+    modeToggle.disabled=true;
+    try{
+      const result=await apiRequest('/api/mode/toggle',{method:'POST'});
+      modeToggle.textContent='Restarting in '+result.mode+' mode...';
+      setTimeout(()=>location.reload(),5000);
+    }catch(error){alert(error.message);modeToggle.disabled=false;}
+  });
+}
+document.querySelectorAll('[data-command]').forEach(button=>{
+  button.addEventListener('click',async()=>{
+    const status=document.getElementById('controlStatus');
+    const command=button.dataset.command;
+    button.disabled=true;
+    if(status)status.textContent='Sending '+command+'...';
+    try{
+      const result=await apiRequest('/api/controller?cmd='+encodeURIComponent(command),{method:'POST'});
+      if(status)status.textContent=result.cmd+' '+result.status+' on channel '+result.channel;
+    }catch(error){if(status)status.textContent='Send failed: '+error.message;}
+    finally{button.disabled=false;}
+  });
+});
+let configEditorLoaded=false;
+function setConfigStatus(message,kind=''){
+  const element=document.getElementById('configStatus');
+  element.textContent=message;
+  element.className='config-status'+(kind?' '+kind:'');
+}
+function configJsonError(error,text){
+  const message=error&&error.message?error.message:String(error);
+  const match=message.match(/position\s+(\d+)/i);
+  if(!match)return message;
+  const position=Math.min(Number(match[1]),text.length);
+  const lines=text.slice(0,position).split('\n');
+  return 'JSON error at line '+lines.length+', column '+(lines[lines.length-1].length+1)+': '+message;
+}
+function parseConfigEditor(showValid=true){
+  const text=document.getElementById('configEditor').value;
+  try{
+    const value=JSON.parse(text);
+    if(!value||Array.isArray(value)||typeof value!=='object')throw new Error('The JSON root must be an object');
+    if(value.mode!==undefined&&!['monitor','controller'].includes(String(value.mode).toLowerCase()))throw new Error('mode must be monitor or controller');
+    if(showValid)setConfigStatus('JSON syntax is valid','ok');
+    return value;
+  }catch(error){setConfigStatus(configJsonError(error,text),'error');return null;}
+}
+async function loadConfigEditor(){
+  setConfigStatus('Loading config.json...');
+  const response=await fetch('/api/config-file',{cache:'no-store'});
+  const text=await response.text();
+  if(!response.ok){let message=text;try{const data=JSON.parse(text);message=data.error||message;}catch(error){}throw new Error(message);}
+  document.getElementById('configEditor').value=text;
+  configEditorLoaded=true;
+  parseConfigEditor(true);
+}
+document.getElementById('toggleConfigFile').addEventListener('click',async()=>{
+  const wrap=document.getElementById('configEditorWrap');
+  const button=document.getElementById('toggleConfigFile');
+  const opening=wrap.hidden;
+  wrap.hidden=!opening;
+  button.textContent=opening?'Hide config.json':'Edit config.json';
+  if(opening&&!configEditorLoaded){try{await loadConfigEditor();}catch(error){setConfigStatus(error.message,'error');}}
+});
+document.getElementById('formatConfig').addEventListener('click',()=>{
+  const value=parseConfigEditor(false);
+  if(!value)return;
+  document.getElementById('configEditor').value=JSON.stringify(value,null,2)+'\n';
+  setConfigStatus('JSON syntax is valid and formatting has been applied','ok');
+});
+document.getElementById('reloadConfigFile').addEventListener('click',async()=>{
+  try{await loadConfigEditor();}catch(error){setConfigStatus(error.message,'error');}
+});
+document.getElementById('saveConfigFile').addEventListener('click',async()=>{
+  if(!parseConfigEditor(false))return;
+  const button=document.getElementById('saveConfigFile');
+  button.disabled=true;
+  setConfigStatus('Saving configuration...');
+  try{
+    const result=await apiRequest('/api/config-file',{method:'POST',headers:{'Content-Type':'application/json'},body:document.getElementById('configEditor').value});
+    await loadConfigEditor();
+    setConfigStatus(result.restartRequired?'Saved. Restart is required for mode or WiFi changes.':'Saved and applied successfully.','ok');
+  }catch(error){setConfigStatus(error.message,'error');}
+  finally{button.disabled=false;}
+});
+document.getElementById('restartDevice').addEventListener('click',async()=>{
+  if(!confirm('Restart the device now? Unsaved editor changes will be lost.'))return;
+  const button=document.getElementById('restartDevice');
+  button.disabled=true;
+  try{
+    await apiRequest('/api/restart',{method:'POST'});
+    setConfigStatus('Restart command sent. Reconnecting in a few seconds...','ok');
+    setTimeout(()=>location.reload(),5000);
+  }catch(error){setConfigStatus(error.message,'error');button.disabled=false;}
+});
 const toggleBtn=document.getElementById('togglePassword');
 const pwdInput=document.getElementById('web_psw');
 if(toggleBtn&&pwdInput){
@@ -2203,7 +2824,7 @@ void WebSeverInit()
 	uint32_t counttime = 0; // 记录创建mDNS的时间
 	Serial.println("mDNS responder building...");
 	counttime = millis();
-	while (!MDNS.begin("MonitorV1"))
+	while (!MDNS.begin("MonitorV12"))
 	{
 		if (millis() - counttime > 30000)
 			ESP.restart(); // 判断超过30秒钟就重启设备
@@ -2212,13 +2833,18 @@ void WebSeverInit()
 	Serial.println("mDNS responder started");
 
 	server.on("/", HandleConfigModern);
+	server.on("/api/controller", HTTP_POST, HandleControllerCommand);
+	server.on("/api/mode/toggle", HTTP_POST, HandleModeToggle);
+	server.on("/api/config-file", HTTP_GET, HandleConfigFileGet);
+	server.on("/api/config-file", HTTP_POST, HandleConfigFileSave);
+	server.on("/api/restart", HTTP_POST, HandleRestart);
 	server.onNotFound(HandleNotFound);
 
 	// 开启TCP服务
 	server.begin();
 	Serial.println("HTTP服务器已开启");
 
-	Serial.println("连接: http://monitor.local");
+	Serial.println("连接: http://monitorv12.local");
 	Serial.print("本地IP： ");
 	Serial.println(WiFi.localIP());
 	// 将服务器添加到mDNS
